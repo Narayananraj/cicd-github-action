@@ -1,0 +1,102 @@
+name: Build Android
+
+on:
+  push:
+    tags:
+      - 'android-v*'
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    name: Build and Deploy Android
+    runs-on: depot-ubuntu-22.04-8
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      CHESSPRIME_API_BASE_URL: ${{ vars.CHESSPRIME_API_BASE_URL || 'https://meet.chessprime.app' }}
+      CHESSPRIME_REALTIME_BASE_URL: ${{ vars.CHESSPRIME_REALTIME_BASE_URL || 'https://realtime.chessprime.app' }}
+      CHESSPRIME_LIVEKIT_URL: ${{ vars.CHESSPRIME_LIVEKIT_URL || 'wss://rtc.chessprime.tech' }}
+      CHESSPRIME_GOOGLE_AUTH_REDIRECT_URI: ${{ vars.CHESSPRIME_GOOGLE_AUTH_REDIRECT_URI || 'app.chessprime.meet://auth/google' }}
+      # Google Maps SDK key (chat location picker + bubbles). Android Maps
+      # keys ship inside the APK by design — app restrictions (package +
+      # SHA-1) are the actual protection; the secret just keeps it out of VCS.
+      CHESSPRIME_GOOGLE_MAPS_API_KEY: ${{ secrets.CHESSPRIME_GOOGLE_MAPS_API_KEY }}
+    defaults:
+      run:
+        working-directory: apps/android
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Validate Android deploy configuration
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          test -n "$CHESSPRIME_API_BASE_URL" || { echo "Missing repo variable CHESSPRIME_API_BASE_URL"; exit 1; }
+          test -n "$CHESSPRIME_REALTIME_BASE_URL" || { echo "Missing repo variable CHESSPRIME_REALTIME_BASE_URL"; exit 1; }
+          test -n "$CHESSPRIME_LIVEKIT_URL" || { echo "Missing repo variable CHESSPRIME_LIVEKIT_URL"; exit 1; }
+          test -n "$KEYSTORE_BASE64" || { echo "Missing secret KEYSTORE_BASE64"; exit 1; }
+          test -n "$KEYSTORE_PASSWORD" || { echo "Missing secret KEYSTORE_PASSWORD"; exit 1; }
+          test -n "$KEY_ALIAS" || { echo "Missing secret KEY_ALIAS"; exit 1; }
+          test -n "$KEY_PASSWORD" || { echo "Missing secret KEY_PASSWORD"; exit 1; }
+          test -n "$GOOGLE_PLAY_SERVICE_ACCOUNT_JSON" || { echo "Missing secret GOOGLE_PLAY_SERVICE_ACCOUNT_JSON"; exit 1; }
+
+      - name: Decode Android keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          KEYSTORE_PATH="$RUNNER_TEMP/chess-prime-android-upload.jks"
+          echo "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
+          echo "CHESSPRIME_ANDROID_KEYSTORE_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
+
+      - name: Build signed Android release
+        env:
+          CHESSPRIME_ANDROID_KEYSTORE_PATH: ${{ env.CHESSPRIME_ANDROID_KEYSTORE_PATH }}
+          CHESSPRIME_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          CHESSPRIME_ANDROID_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          CHESSPRIME_ANDROID_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          ./gradlew clean assembleRelease bundleRelease --no-configuration-cache
+
+      - name: Upload Android bundle artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: android-release-bundle-${{ github.run_number }}
+          path: apps/android/app/build/outputs/bundle/release/*.aab
+          if-no-files-found: error
+
+      - name: Upload Android APK artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: android-release-apk-${{ github.run_number }}
+          path: apps/android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+
+      - name: Upload to Google Play internal track
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: com.chessprime.meet
+          releaseFiles: apps/android/app/build/outputs/bundle/release/*.aab
+          track: internal
+          status: completed
+          inAppUpdatePriority: 0
+          changesNotSentForReview: false
