@@ -1,0 +1,120 @@
+name: CI - Deploy to EKS - Shorts API
+on:
+  push:
+    branches:
+      - dev
+    paths:
+      - 'packages/apis/apps/shorts-api/**'
+      - '.github/workflows/staging-shorts-api.yml'
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: shorts-api
+  EKS_CLUSTER_NAME: your-eks-cluster
+  K8S_NAMESPACE: staging
+  K8S_DEPLOYMENT: shorts-api
+
+jobs:
+  build-and-deploy:
+    name: Build, push, deploy, notify
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      id-token: write   # needed for OIDC role assumption (no static keys)
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # --- Auth to AWS via OIDC (no long-lived secrets = more secure + cheaper key rotation ops) ---
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          cd packages/apis
+          docker build -f apps/shorts-api/docker/staging/Dockerfile \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ env.EKS_CLUSTER_NAME }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Deploy new image to K8s
+        id: deploy
+        run: |
+          kubectl set image deployment/${{ env.K8S_DEPLOYMENT }} \
+            ${{ env.K8S_DEPLOYMENT }}=${{ steps.build-image.outputs.image }} \
+            -n ${{ env.K8S_NAMESPACE }} --record
+
+      - name: Verify rollout
+        id: rollout
+        run: |
+          kubectl rollout status deployment/${{ env.K8S_DEPLOYMENT }} \
+            -n ${{ env.K8S_NAMESPACE }} --timeout=180s
+
+      # --- Slack: success ---
+      - name: Notify Slack - success
+        if: success()
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "attachments": [{
+                "color": "#22c55e",
+                "blocks": [
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": "*✅ Deploy succeeded — shorts-api*\n*Env:* staging\n*Commit:* <${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>\n*By:* ${{ github.actor }}\n*Run:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View logs>"
+                    }
+                  }
+                ]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      # --- Slack: failure ---
+      - name: Notify Slack - failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "attachments": [{
+                "color": "#ef4444",
+                "blocks": [
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": "*❌ Deploy failed — shorts-api*\n*Env:* staging\n*Commit:* <${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>\n*By:* ${{ github.actor }}\n*Run:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View logs — check which step failed>"
+                    }
+                  }
+                ]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
