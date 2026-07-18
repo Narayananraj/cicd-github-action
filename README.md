@@ -1,99 +1,62 @@
-# CI/CD GitHub Actions Repository
+# CI/CD Learning Repo
 
-This repository provides a reusable GitHub Actions-based CI/CD setup for modern application delivery across multiple platforms, including:
+A hands-on collection of production-style GitHub Actions CI/CD pipelines, built while learning DevOps, MLOps, and Cloud practices — covering containerized backend deploys, mobile app releases, and desktop app distribution. Each workflow is a real, runnable example, not a toy — the goal is practical, real-world capability.
 
-- Web applications
-- Android apps
-- iOS apps
-- Desktop applications for Windows and macOS
+## Why this repo exists
 
-It is designed to help teams automate build, test, packaging, and deployment workflows with a consistent and scalable approach.
+Most CI/CD tutorials stop at "build and push." These examples go further:
+- Secret validation before the expensive steps run
+- Retry logic for known-flaky third-party downloads
+- Slack success/failure notifications on every pipeline
+- Checksums, artifact retention, and cleanup of sensitive files
+- Cost-consciousness baked into every design choice, not bolted on after
 
-## Features
+## Workflow examples in this repo
 
-- Automated build and test pipelines for multiple platforms
-- Reusable GitHub Actions workflows
-- Support for web, mobile, and desktop releases
-- Easy integration with GitHub Releases, artifact upload, and deployment targets
-- Flexible configuration for development, staging, and production environments
+| File | What it teaches | Deploy target |
+|---|---|---|
+| `k8s-deploy.yml` | Docker build → ECR push → `kubectl` deploy → rollout verification → Slack notify | AWS EKS (`ap-south-1`) |
+| `build-android.yml` | Signed AAB build → Google Play internal track | Google Play |
+| `build-ios.yml` | Xcode archive/export with manual signing → TestFlight, using a Depot macOS runner | TestFlight |
+| `build-desktop.yml` | Multi-OS (macOS + Windows) Rust build → notarization/signing → S3 release with signed update manifest | S3 / DigitalOcean Spaces |
+| `build-androidtv.yml` | Gradle-based native Android TV signed release with caching | Google Play |
 
-## Supported Platforms
+Each workflow file has inline comments explaining *why* a step exists, not just *what* it does — especially around retry logic, secret handling, and signing.
 
-### Web
-- Build frontend applications
-- Run unit and integration tests
-- Deploy to hosting platforms such as Vercel, Netlify, Azure, or custom servers
+## Core concepts covered so far
 
-### Android
-- Build APK/AAB artifacts
-- Run Android tests
-- Sign and publish app bundles for distribution
+- **Secrets & signing**: keystores, provisioning profiles, code signing certs, OIDC vs static AWS keys
+- **Kubernetes deploys**: `kubectl set image`, rollout status checks, namespace-scoped deploys
+- **Container registries**: ECR login, image tagging strategy (SHA + latest), lifecycle policies
+- **Build reliability**: retry wrappers for flaky network downloads (CocoaPods, WebRTC prebuilt binaries)
+- **Notifications**: Slack webhook (simple pass/fail) vs Slack Bot API (file upload + threaded release notes)
+- **Caching**: Gradle and Cargo dependency caching to cut runner minutes
+- **Release management**: version/channel inference from git tags, signed update manifests (Ed25519)
 
-### iOS
-- Build iOS applications
-- Run test suites
-- Archive and export builds for App Store or TestFlight deployment
+## Cost optimization checklist
 
-### Desktop
-- Build Windows executables and installers
-- Build macOS applications and packages
-- Prepare artifacts for distribution
+Applied across these pipelines — use this as a reference when adding a new workflow:
 
-## Project Structure
+- [ ] Use OIDC role assumption instead of long-lived cloud provider keys
+- [ ] Cache dependencies (Gradle `~/.gradle`, Cargo `~/.cargo`, npm/pnpm store) keyed on lockfile hash
+- [ ] Set an ECR/registry lifecycle policy to expire untagged images
+- [ ] Right-size runners — don't default to the largest Depot/self-hosted tier without benchmarking
+- [ ] Use `continue-on-error: true` only where a failure is genuinely non-fatal (e.g., re-upload of an existing version)
+- [ ] Set resource `requests/limits` on K8s deployments so autoscalers don't over-provision
+- [ ] Prefer GitHub-hosted runners over paid runner services unless build time is an actual bottleneck
 
-A typical workflow repository includes:
+## Roadmap — topics to add next
 
-- .github/workflows/: GitHub Actions workflow definitions
-- scripts/: Build and deployment helper scripts
-- docs/: Setup and usage documentation
+- [ ] Helm-based K8s deploy (replace raw `kubectl set image` with `helm upgrade --install`)
+- [ ] ArgoCD GitOps example (CI only builds/pushes; ArgoCD syncs the cluster)
+- [ ] Terraform-triggered infra pipeline (plan on PR, apply on merge, remote state via S3 + DynamoDB)
+- [ ] OPA Gatekeeper / Kyverno policy-as-code checks in CI
+- [ ] Kubecost/OpenCost integration for cost visibility dashboards
+- [ ] Canary/blue-green deploy pattern with Argo Rollouts
+- [ ] Fastlane consolidation for iOS/Android/Desktop signing logic
 
-## Getting Started
+## How to use this repo
 
-1. Clone this repository.
-2. Add or customize your workflow files under .github/workflows/.
-3. Configure repository secrets and variables for signing keys, deployment credentials, and environment settings.
-4. Push changes to trigger CI/CD pipelines automatically.
-
-## Example Workflow
-
-Use a workflow such as this to automate your build pipeline:
-
-```yaml
-name: CI
-
-on:
-  push:
-    branches:
-      - main
-  pull_request:
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set up environment
-        run: echo "Setting up CI environment"
-      - name: Run build
-        run: echo "Build completed"
-```
-
-## Recommended Secrets
-
-Set up the following GitHub repository secrets as needed:
-
-- SSH_PRIVATE_KEY
-- ANDROID_KEYSTORE
-- APPLE_CERTIFICATE
-- APPLE_API_KEY
-- DEPLOY_TOKEN
-- AWS_ACCESS_KEY_ID
-- AWS_SECRET_ACCESS_KEY
-
-## Notes
-
-This repository is intended as a starting point for CI/CD automation. You can extend it with platform-specific steps for your app stack, deployment targets, and release policies.
-
-## License
-
-This project is provided as a template for educational and production use. Please review and adjust the configuration according to your organization’s requirements.
+1. Each workflow file is standalone — copy the one you need into `.github/workflows/` in your own project.
+2. Replace placeholder secret names and package/bundle identifiers with your own.
+3. Read the inline comments before removing anything that looks like "unnecessary" retry logic or validation — most of it exists because of a real failure encountered while building these.
