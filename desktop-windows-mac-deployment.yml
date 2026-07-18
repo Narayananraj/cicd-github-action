@@ -1,0 +1,682 @@
+name: Build Desktop
+
+on:
+  push:
+    tags:
+      - 'desktop-v*'
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type'
+        required: false
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+
+env:
+  CARGO_TERM_COLOR: always
+  APP_NAME: chess-prime-desktop
+  APP_DISPLAY_NAME: Chess Prime
+
+jobs:
+  # ----------------------------------------------------------------
+  # Infer release channel and version from the git tag
+  # ----------------------------------------------------------------
+  prepare:
+    name: Prepare release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      channel: ${{ steps.meta.outputs.channel }}
+      is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
+      s3_version_prefix: ${{ steps.meta.outputs.s3_version_prefix }}
+    steps:
+      - name: Derive channel and version from tag
+        id: meta
+        run: |
+          TAG="${GITHUB_REF_NAME:-desktop-v0.0.0}"
+          VERSION="${TAG#desktop-v}"
+          VERSION="${VERSION:-0.0.0}"
+
+          if echo "$VERSION" | grep -qE '[-](beta|rc|alpha)'; then
+            CHANNEL="beta"
+            IS_PRERELEASE="true"
+          else
+            CHANNEL="release"
+            IS_PRERELEASE="false"
+          fi
+
+          S3_VERSION_PREFIX="updates/${CHANNEL}/v${VERSION}"
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "channel=${CHANNEL}" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=${IS_PRERELEASE}" >> "$GITHUB_OUTPUT"
+          echo "s3_version_prefix=${S3_VERSION_PREFIX}" >> "$GITHUB_OUTPUT"
+
+          echo "### Release Metadata" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Version:** ${VERSION}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Channel:** ${CHANNEL}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Pre-release:** ${IS_PRERELEASE}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **S3 prefix:** ${S3_VERSION_PREFIX}" >> "$GITHUB_STEP_SUMMARY"
+
+  # ----------------------------------------------------------------
+  # Preflight: validate Apple signing secrets
+  # ----------------------------------------------------------------
+  preflight:
+    name: Preflight Checks
+    runs-on: [self-hosted, macos-inhouse]
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Validate secrets
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.DESKTOP_APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.DESKTOP_APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          MISSING=()
+          [ -z "$APPLE_CERTIFICATE_BASE64" ] && MISSING+=("APPLE_CERTIFICATE_BASE64")
+          [ -z "$APPLE_CERTIFICATE_PASSWORD" ] && MISSING+=("APPLE_CERTIFICATE_PASSWORD")
+          [ -z "$APPLE_TEAM_ID" ] && MISSING+=("APPLE_TEAM_ID")
+          [ -z "$APPLE_API_KEY_ID" ] && MISSING+=("APPLE_API_KEY_ID")
+          [ -z "$APPLE_API_ISSUER_ID" ] && MISSING+=("APPLE_API_ISSUER_ID")
+          [ -z "$APPLE_API_KEY" ] && MISSING+=("APPLE_API_KEY")
+
+          if [ ${#MISSING[@]} -gt 0 ]; then
+            echo "::error::Missing secrets: ${MISSING[*]}"
+            exit 1
+          fi
+          echo "All secrets present."
+
+      - name: Validate certificate and signing identity
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.DESKTOP_APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.DESKTOP_APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/preflight.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$CERT_PATH"
+
+          if ! security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH" 2>&1; then
+            echo "::error::Failed to import certificate. Check APPLE_CERTIFICATE_BASE64 and APPLE_CERTIFICATE_PASSWORD."
+            security delete-keychain "$KEYCHAIN_PATH" || true
+            exit 1
+          fi
+
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+
+          IDENTITY=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ -z "$IDENTITY" ]; then
+            echo "::error::No 'Developer ID Application' identity found. Ensure APPLE_CERTIFICATE_BASE64 contains a Developer ID Application certificate."
+            security find-identity -v -p codesigning
+            security delete-keychain "$KEYCHAIN_PATH" || true
+            exit 1
+          fi
+
+          echo "Signing identity: $IDENTITY"
+          security delete-keychain "$KEYCHAIN_PATH"
+
+      - name: Validate API key format
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          if ! echo "$APPLE_API_KEY" | grep -q "BEGIN PRIVATE KEY"; then
+            echo "::error::APPLE_API_KEY does not look like a .p8 private key (missing BEGIN PRIVATE KEY header)."
+            exit 1
+          fi
+          echo "API key format OK."
+
+  # ----------------------------------------------------------------
+  # macOS: universal binary, sign, notarize, DMG
+  # ----------------------------------------------------------------
+  build-macos:
+    name: Build macOS (Universal)
+    needs: [prepare, preflight]
+    runs-on: [self-hosted, macos-inhouse]
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    env:
+      RUSTC_WRAPPER: sccache
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-universal-cargo-${{ hashFiles('apps/desktop/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-universal-cargo-
+
+      - name: Build release binaries
+        working-directory: apps/desktop
+        run: |
+          # webrtc-sys downloads a prebuilt WebRTC blob in its build script and
+          # occasionally fails on a transient runner network error (build.rs:103
+          # "Failed to send HTTP request to download WebRTC"). cargo re-runs the
+          # failed build script on the next invocation, so retry a few times so a
+          # flaky download doesn't fail the whole release.
+          build_with_retry() {
+            local target="$1"
+            local attempt=1 max=3
+            until cargo build --release --target "$target"; do
+              if [ "$attempt" -ge "$max" ]; then
+                echo "::error::cargo build failed for $target after $max attempts" >&2
+                return 1
+              fi
+              echo "cargo build for $target failed (attempt $attempt/$max); retrying in 15s..." >&2
+              attempt=$((attempt + 1))
+              sleep 15
+            done
+          }
+          build_with_retry aarch64-apple-darwin
+          build_with_retry x86_64-apple-darwin
+
+      - name: Show sccache stats
+        working-directory: apps/desktop
+        run: |
+          "${SCCACHE_PATH}" --show-stats
+
+      - name: Create universal binary
+        working-directory: apps/desktop
+        run: |
+          lipo -create \
+            target/aarch64-apple-darwin/release/${{ env.APP_NAME }} \
+            target/x86_64-apple-darwin/release/${{ env.APP_NAME }} \
+            -output ${{ env.APP_NAME }}-universal
+          file ${{ env.APP_NAME }}-universal
+
+      - name: Import signing certificate
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.DESKTOP_APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.DESKTOP_APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$CERT_PATH"
+          security import "$CERT_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> $GITHUB_ENV
+
+      - name: Create macOS .app bundle
+        working-directory: apps/desktop
+        run: |
+          VERSION="${{ needs.prepare.outputs.version }}"
+          APP_DIR="${{ env.APP_DISPLAY_NAME }}.app"
+          CONTENTS_DIR="${APP_DIR}/Contents"
+          MACOS_DIR="${CONTENTS_DIR}/MacOS"
+          RESOURCES_DIR="${CONTENTS_DIR}/Resources"
+
+          mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}"
+
+          cp "${{ env.APP_NAME }}-universal" "${MACOS_DIR}/${{ env.APP_DISPLAY_NAME }}"
+
+          cat > "${CONTENTS_DIR}/Info.plist" << PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key>
+            <string>${{ env.APP_DISPLAY_NAME }}</string>
+            <key>CFBundleDisplayName</key>
+            <string>${{ env.APP_DISPLAY_NAME }}</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.chessprime.meet.desktop</string>
+            <key>CFBundleVersion</key>
+            <string>${VERSION}</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${VERSION}</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleExecutable</key>
+            <string>${{ env.APP_DISPLAY_NAME }}</string>
+            <key>CFBundleIconFile</key>
+            <string>AppIcon</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>13.0</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+            <key>NSCameraUsageDescription</key>
+            <string>Chess Prime needs camera access for video calls.</string>
+            <key>NSMicrophoneUsageDescription</key>
+            <string>Chess Prime needs microphone access for audio calls.</string>
+            <key>NSScreenCaptureUsageDescription</key>
+            <string>Chess Prime needs screen recording access to share your screen.</string>
+            <key>CFBundleURLTypes</key>
+            <array>
+              <dict>
+                <key>CFBundleURLName</key>
+                <string>com.chessprime.meet.desktop</string>
+                <key>CFBundleURLSchemes</key>
+                <array>
+                  <string>chessprime</string>
+                </array>
+              </dict>
+            </array>
+          </dict>
+          </plist>
+          PLIST
+
+          if [ -f "assets/AppIcon.icns" ]; then
+            cp "assets/AppIcon.icns" "${RESOURCES_DIR}/AppIcon.icns"
+          fi
+
+          cat > "entitlements.plist" << PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.security.device.audio-input</key>
+            <true/>
+            <key>com.apple.security.device.camera</key>
+            <true/>
+            <key>com.apple.security.network.client</key>
+            <true/>
+            <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+
+      - name: Code sign
+        working-directory: apps/desktop
+        run: |
+          # Auto-detect the Developer ID Application identity from the keychain
+          IDENTITY=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "Signing with: $IDENTITY"
+
+          codesign --force --deep --timestamp \
+            --options runtime \
+            --sign "$IDENTITY" \
+            --entitlements "entitlements.plist" \
+            "${{ env.APP_DISPLAY_NAME }}.app"
+
+      - name: Verify signed app
+        working-directory: apps/desktop
+        run: |
+          codesign --verify --deep --strict --verbose=2 "${{ env.APP_DISPLAY_NAME }}.app"
+          codesign -d --entitlements :- "${{ env.APP_DISPLAY_NAME }}.app"
+
+      - name: Create DMG
+        working-directory: apps/desktop
+        run: |
+          IDENTITY=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          VERSION="${{ needs.prepare.outputs.version }}"
+          DMG_NAME="chess-prime-${VERSION}-macos-universal.dmg"
+
+          DMG_STAGE="dmg-stage"
+          rm -rf "$DMG_STAGE"
+          mkdir -p "$DMG_STAGE"
+          cp -R "${{ env.APP_DISPLAY_NAME }}.app" "$DMG_STAGE/"
+          # A plain symlink is CI-safe and avoids Finder AppleEvent timeouts on GitHub runners.
+          ln -s /Applications "$DMG_STAGE/Applications"
+
+          hdiutil create -volname "${{ env.APP_DISPLAY_NAME }}" \
+            -srcfolder "$DMG_STAGE" \
+            -ov -format UDZO \
+            "${DMG_NAME}"
+
+          codesign --force --timestamp \
+            --sign "$IDENTITY" \
+            "${DMG_NAME}"
+
+          echo "DMG_NAME=${DMG_NAME}" >> $GITHUB_ENV
+
+      - name: Notarize DMG
+        working-directory: apps/desktop
+        env:
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          API_KEY_DIR="$RUNNER_TEMP/private_keys"
+          mkdir -p "$API_KEY_DIR"
+          printenv APPLE_API_KEY > "$API_KEY_DIR/AuthKey_${APPLE_API_KEY_ID}.p8"
+
+          # Debug: verify key structure (first/last line only)
+          head -1 "$API_KEY_DIR/AuthKey_${APPLE_API_KEY_ID}.p8"
+          tail -1 "$API_KEY_DIR/AuthKey_${APPLE_API_KEY_ID}.p8"
+          wc -l "$API_KEY_DIR/AuthKey_${APPLE_API_KEY_ID}.p8"
+
+          xcrun notarytool submit "${{ env.DMG_NAME }}" \
+            --key "$API_KEY_DIR/AuthKey_${APPLE_API_KEY_ID}.p8" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID" \
+            --wait
+
+          xcrun stapler staple "${{ env.DMG_NAME }}"
+
+      - name: Cleanup keychain
+        if: always()
+        run: |
+          if [ -n "$KEYCHAIN_PATH" ]; then
+            security delete-keychain "$KEYCHAIN_PATH" || true
+          fi
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: apps/desktop/${{ env.DMG_NAME }}
+          retention-days: 30
+
+  # ----------------------------------------------------------------
+  # Windows build
+  # ----------------------------------------------------------------
+  build-windows:
+    name: Build Windows
+    needs: [prepare, preflight]
+    runs-on: depot-windows-2025-4
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    env:
+      RUSTC_WRAPPER: sccache
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('apps/desktop/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build release binary
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          # Same transient webrtc-sys download flake guard as macOS — retry the
+          # build so a failed WebRTC download doesn't fail the whole release.
+          attempt=1; max=3
+          until cargo build --release --target x86_64-pc-windows-msvc; do
+            if [ "$attempt" -ge "$max" ]; then
+              echo "::error::cargo build failed after $max attempts" >&2
+              exit 1
+            fi
+            echo "cargo build failed (attempt $attempt/$max); retrying in 15s..." >&2
+            attempt=$((attempt + 1))
+            sleep 15
+          done
+
+      - name: Show sccache stats
+        shell: pwsh
+        run: |
+          & $env:SCCACHE_PATH --show-stats
+
+      - name: Prepare Windows distribution
+        working-directory: apps/desktop
+        shell: pwsh
+        run: |
+          $Version = "${{ needs.prepare.outputs.version }}"
+          $DistDir = "dist"
+          New-Item -ItemType Directory -Force -Path $DistDir
+
+          # Copy binary
+          Copy-Item "target/x86_64-pc-windows-msvc/release/${{ env.APP_NAME }}.exe" "$DistDir/${{ env.APP_DISPLAY_NAME }}.exe"
+
+          # Create zip
+          $ZipName = "chess-prime-${Version}-windows-x64.zip"
+          Compress-Archive -Path "$DistDir/*" -DestinationPath $ZipName
+          echo "ZIP_NAME=$ZipName" >> $env:GITHUB_ENV
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          # Add ISCC to PATH
+          $isccDir = "C:\Program Files (x86)\Inno Setup 6"
+          if (Test-Path $isccDir) {
+            echo "$isccDir" >> $env:GITHUB_PATH
+          }
+
+      - name: Build installer
+        working-directory: apps/desktop
+        shell: pwsh
+        run: |
+          $Version = "${{ needs.prepare.outputs.version }}"
+          $SetupName = "chess-prime-${Version}-windows-x64-Setup.exe"
+          $ExpectedOutput = "installer\windows\Output\${SetupName}"
+          $SourceDir = (Resolve-Path "dist").Path
+          iscc /DAppVersion=$Version "/DSourceDir=$SourceDir" "installer\windows\chess-prime.iss"
+          if (-not (Test-Path $ExpectedOutput)) {
+            Write-Error "Inno Setup did not produce expected output: $ExpectedOutput"
+            exit 1
+          }
+          Move-Item $ExpectedOutput $SetupName
+          echo "SETUP_NAME=$SetupName" >> $env:GITHUB_ENV
+
+      - name: Upload Windows zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: apps/desktop/${{ env.ZIP_NAME }}
+          retention-days: 30
+
+      - name: Upload Windows installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-setup
+          path: apps/desktop/${{ env.SETUP_NAME }}
+          retention-days: 30
+
+  # ----------------------------------------------------------------
+  # Publish: checksums, latest.json, S3 upload, GitHub Release
+  # ----------------------------------------------------------------
+  publish:
+    name: Publish release
+    needs: [prepare, build-macos, build-windows]
+    if: startsWith(github.ref, 'refs/tags/desktop-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect and checksum
+        run: |
+          mkdir -p publish
+          find artifacts -type f \( -name '*.dmg' -o -name '*.zip' -o -name '*-Setup.exe' \) | while read -r file; do
+            cp "$file" publish/
+          done
+          cd publish
+          sha256sum * > SHA256SUMS
+          echo "### Artifacts" >> "$GITHUB_STEP_SUMMARY"
+          cat SHA256SUMS >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Generate latest.json
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          CHANNEL: ${{ needs.prepare.outputs.channel }}
+          S3_VERSION_PREFIX: ${{ needs.prepare.outputs.s3_version_prefix }}
+          CDN_URL: ${{ secrets.SPACES_CDN_URL }}
+        run: |
+          # Fallback must match the client's compiled default update host
+          # (DEFAULT_UPDATE_BASE_URL in apps/desktop/src/update/check.rs) —
+          # with the secret unset, latest.json otherwise pointed assets at
+          # the raw Spaces origin instead of the canonical release domain.
+          CDN="${CDN_URL:-https://chess-prime-releases.chessprime.app}"
+          cd publish
+
+          build_asset() {
+            local key="$1" pattern="$2"
+            local file
+            file=$(ls $pattern 2>/dev/null | head -1)
+            if [ -n "$file" ] && [ -f "$file" ]; then
+              local sha=$(grep "$(basename "$file")" SHA256SUMS | awk '{print $1}')
+              local size=$(stat --printf="%s" "$file" 2>/dev/null || stat -f "%z" "$file" 2>/dev/null)
+              echo "\"${key}\": {\"url\": \"${CDN}/${S3_VERSION_PREFIX}/$(basename "$file")\", \"sha256\": \"${sha}\", \"size\": ${size}}"
+            fi
+          }
+
+          MACOS_ASSET=$(build_asset "macos-universal" "*-macos-universal.dmg" 2>/dev/null || true)
+          WINDOWS_ASSET=$(build_asset "windows-x64" "*-windows-x64.zip" 2>/dev/null || true)
+          ASSETS="{"
+          SEP=""
+          for entry in "$MACOS_ASSET" "$WINDOWS_ASSET"; do
+            if [ -n "$entry" ]; then
+              ASSETS="${ASSETS}${SEP}${entry}"
+              SEP=","
+            fi
+          done
+          ASSETS="${ASSETS}}"
+
+          PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          cat > latest.json << EOF
+          {
+            "channel": "${CHANNEL}",
+            "version": "${VERSION}",
+            "pub_date": "${PUB_DATE}",
+            "notes": "See release notes for details.",
+            "assets": ${ASSETS}
+          }
+          EOF
+
+          cat latest.json | python3 -m json.tool || cat latest.json
+
+      - name: Sign latest.json (Ed25519)
+        env:
+          MANIFEST_SIGNING_KEY: ${{ secrets.MANIFEST_ED25519_PRIVATE_KEY }}
+        run: |
+          if [ -z "$MANIFEST_SIGNING_KEY" ]; then
+            echo "::error::MANIFEST_ED25519_PRIVATE_KEY is required for signed desktop releases"
+            exit 1
+          fi
+
+          pip install pynacl --quiet
+          python3 - << 'PYEOF'
+          import base64, os
+          from nacl.signing import SigningKey
+
+          key_b64 = os.environ["MANIFEST_SIGNING_KEY"]
+          key_bytes = base64.b64decode(key_b64)
+          signing_key = SigningKey(key_bytes)
+
+          with open("publish/latest.json", "rb") as f:
+              data = f.read()
+
+          sig = signing_key.sign(data).signature
+          sig_b64 = base64.b64encode(sig).decode()
+
+          with open("publish/latest.json.sig", "w") as f:
+              f.write(sig_b64)
+
+          verify_b64 = base64.b64encode(signing_key.verify_key.encode()).decode()
+          print(f"Manifest signed. Verify key: {verify_b64}")
+          PYEOF
+
+      - name: Upload to S3 (DigitalOcean Spaces)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.SPACES_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.SPACES_SECRET_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.SPACES_REGION }}
+          S3_BUCKET: ${{ secrets.SPACES_BUCKET }}
+          S3_ENDPOINT: ${{ secrets.SPACES_ENDPOINT }}
+          S3_VERSION_PREFIX: ${{ needs.prepare.outputs.s3_version_prefix }}
+          CHANNEL: ${{ needs.prepare.outputs.channel }}
+        run: |
+          if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$S3_BUCKET" ]; then
+            echo "::warning::S3/Spaces credentials not configured — skipping upload"
+            exit 0
+          fi
+
+          ENDPOINT_FLAG=""
+          if [ -n "$S3_ENDPOINT" ]; then
+            ENDPOINT_FLAG="--endpoint-url ${S3_ENDPOINT}"
+          fi
+
+          # Upload versioned artifacts
+          for file in publish/*.dmg publish/*.zip publish/*-Setup.exe publish/SHA256SUMS; do
+            [ -f "$file" ] || continue
+            aws s3 cp "$file" "s3://${S3_BUCKET}/${S3_VERSION_PREFIX}/$(basename $file)" \
+              $ENDPOINT_FLAG --acl public-read
+          done
+
+          # Upload latest.json and signature to channel root.
+          # NOTE: the desktop client only polls updates/release (a single
+          # Release variant in update/channel.rs — a beta manifest wouldn't
+          # even deserialize). Prerelease tags still upload their versioned
+          # artifacts above for manual distribution, but skip the channel-
+          # root manifest so we don't publish updates nobody can receive.
+          if [ "$CHANNEL" != "release" ]; then
+            echo "Prerelease channel '$CHANNEL' — skipping latest.json publish"
+            exit 0
+          fi
+          aws s3 cp publish/latest.json "s3://${S3_BUCKET}/updates/${CHANNEL}/latest.json" \
+            $ENDPOINT_FLAG --acl public-read \
+            --cache-control "public, max-age=60" \
+            --content-type "application/json"
+
+          aws s3 cp publish/latest.json.sig "s3://${S3_BUCKET}/updates/${CHANNEL}/latest.json.sig" \
+            $ENDPOINT_FLAG --acl public-read \
+            --cache-control "public, max-age=60" \
+            --content-type "text/plain"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          draft: true
+          prerelease: ${{ needs.prepare.outputs.is_prerelease == 'true' }}
+          files: |
+            publish/*.dmg
+            publish/*.zip
+            publish/*-Setup.exe
+            publish/SHA256SUMS

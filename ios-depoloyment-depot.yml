@@ -1,0 +1,439 @@
+name: Build iOS
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build-chess-prime-ios:
+    timeout-minutes: 45
+    name: Build Chess Prime iOS
+    runs-on: depot-macos-15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+          cache: 'pnpm'
+          cache-dependency-path: ./packages/app/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: ./packages/app
+        run: pnpm install
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "26"
+
+      - name: Setup iOS platform
+        run: |
+          # Accept Xcode license
+          sudo xcodebuild -license accept
+
+          # Run first launch to install required Xcode components and device support
+          sudo xcodebuild -runFirstLaunch
+
+          # Show current Xcode and SDK info
+          echo "=== Xcode Version ==="
+          xcodebuild -version
+          echo "=== Selected Xcode ==="
+          xcode-select -p
+          echo "=== Available SDKs ==="
+          xcodebuild -showsdks
+
+          # Download iOS platform (required for Xcode 16+ on macOS Sequoia)
+          echo "=== Downloading iOS Platform ==="
+          for i in 1 2 3; do
+            xcodebuild -downloadPlatform iOS && break
+            echo "Attempt $i failed, retrying in 15 seconds..."
+            sleep 15
+          done
+
+          # Verify iOS platform is available
+          echo "=== Verifying iOS SDK ==="
+          xcodebuild -showsdks | grep -i iphoneos
+
+      - name: Install xcpretty
+        run: sudo gem install -n /usr/local/bin xcpretty
+
+      - name: Import Code Signing Certificate
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+
+      - name: Install Provisioning Profile
+        env:
+          PROVISIONING_PROFILE_BASE64: ${{ secrets.APPLE_PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          # Create Provisioning Profiles directory
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+
+          # Decode and install provisioning profile
+          echo "$PROVISIONING_PROFILE_BASE64" | base64 --decode > ~/Library/MobileDevice/Provisioning\ Profiles/profile.mobileprovision
+
+          # Get the UUID of the provisioning profile
+          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print :UUID" /dev/stdin <<< $(security cms -D -i ~/Library/MobileDevice/Provisioning\ Profiles/profile.mobileprovision))
+          echo "PROVISIONING_PROFILE_UUID=$PROFILE_UUID" >> $GITHUB_ENV
+
+          # Rename to UUID for Xcode to find it
+          mv ~/Library/MobileDevice/Provisioning\ Profiles/profile.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/$PROFILE_UUID.mobileprovision
+
+          echo "Provisioning profile installed with UUID: $PROFILE_UUID"
+
+      - name: Extract version
+        working-directory: ./packages/app
+        run: |
+          APP_VERSION=$(node -p "require('./app.config.js').expo.version")
+          echo "APP_VERSION=$APP_VERSION" >> $GITHUB_ENV
+          echo "Building Chess Prime iOS version: $APP_VERSION"
+
+      - name: Inject GoogleService-Info.plist from secrets
+        working-directory: ./packages/app
+        env:
+          GOOGLE_SERVICE_INFO_PLIST: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${GOOGLE_SERVICE_INFO_PLIST:-}" ]; then
+            printf '%s' "$GOOGLE_SERVICE_INFO_PLIST" > GoogleService-Info.plist
+            echo "Injected GoogleService-Info.plist from GOOGLE_SERVICE_INFO_PLIST"
+          else
+            echo "Missing iOS Firebase secret. Set GOOGLE_SERVICE_INFO_PLIST."
+            exit 1
+          fi
+
+          if ! grep -q "<string>vgts.lmes.chessprime</string>" GoogleService-Info.plist; then
+            echo "⚠️ GoogleService-Info.plist BUNDLE_ID may not be vgts.lmes.chessprime"
+          fi
+
+      - name: Build iOS Release
+        env:
+          APP_ENV: production
+          # Authorises the @sentry/react-native source-map upload that runs
+          # inside the xcodebuild archive bundle phase. When this secret is
+          # unset the build skips the upload (see SENTRY_DISABLE_AUTO_UPLOAD
+          # below) instead of failing, so the IPA still gets produced.
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+        working-directory: ./packages/app
+        run: |
+          echo "Starting iOS build..."
+          BUILD_START_TIME=$(date +%s)
+
+          # Install Expo CLI
+          npm install -g @expo/cli@latest
+
+          # Set environment
+          export APP_ENV=production
+          echo "Building for environment: $APP_ENV"
+
+          # Sentry source-map upload needs an auth token. If the
+          # SENTRY_AUTH_TOKEN secret is not configured, disable the upload so
+          # the bundle phase is skipped rather than failing the whole build
+          # with "Auth token is required for this request". Once the secret is
+          # added in repo settings, uploads happen automatically.
+          if [ -z "${SENTRY_AUTH_TOKEN:-}" ]; then
+            echo "⚠️ SENTRY_AUTH_TOKEN not set — disabling Sentry source map upload"
+            export SENTRY_DISABLE_AUTO_UPLOAD=true
+          else
+            echo "✅ SENTRY_AUTH_TOKEN present — Sentry source map upload enabled"
+            # A Sentry outage must not block a release. SENTRY_ALLOW_FAILURE
+            # lets the sentry-cli xcode wrapper continue the build when the
+            # source-map upload fails, so the IPA is still produced — only
+            # symbolication is delayed until the next successful upload.
+            export SENTRY_ALLOW_FAILURE=true
+          fi
+
+          # Prebuild the native iOS project
+          npx expo prebuild --platform ios --clean
+
+          cd ios
+
+          # Clean CocoaPods cache and derived data
+          rm -rf ~/Library/Developer/Xcode/DerivedData/*
+          pod cache clean --all
+
+          # Install CocoaPods dependencies with repo update.
+          # CocoaPods downloads some prebuilt xcframeworks (e.g. FBAEMKit pulls
+          # FacebookSDK_Dynamic.xcframework.zip from GitHub releases) during
+          # install. GitHub's download CDN intermittently returns 5xx (504), which
+          # aborts the whole build. Retry a few times so a single transient
+          # gateway error does not fail an otherwise healthy release build.
+          POD_INSTALL_ATTEMPTS=5
+          for attempt in $(seq 1 $POD_INSTALL_ATTEMPTS); do
+            echo "=== pod install attempt $attempt/$POD_INSTALL_ATTEMPTS ==="
+            if pod install --repo-update; then
+              echo "✅ pod install succeeded on attempt $attempt"
+              break
+            fi
+            if [ "$attempt" -eq "$POD_INSTALL_ATTEMPTS" ]; then
+              echo "❌ pod install failed after $POD_INSTALL_ATTEMPTS attempts"
+              exit 1
+            fi
+            SLEEP=$((attempt * 20))
+            echo "pod install failed, retrying in ${SLEEP}s..."
+            sleep "$SLEEP"
+          done
+
+          # Create ExportOptions.plist for archive export
+          cat > ExportOptions.plist << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>method</key>
+              <string>app-store</string>
+              <key>teamID</key>
+              <string>FJFXSL4G63</string>
+              <key>signingStyle</key>
+              <string>manual</string>
+              <key>provisioningProfiles</key>
+              <dict>
+                  <key>vgts.lmes.chessprime</key>
+                  <string>${PROVISIONING_PROFILE_UUID}</string>
+              </dict>
+          </dict>
+          </plist>
+          EOF
+
+          # List available schemes for debugging
+          echo "=== Available Schemes ==="
+          xcodebuild -workspace ChessPrime.xcworkspace -list
+
+          # Build archive for iOS device. The ChessPrime target's signing
+          # settings (Manual style, team, identity, profile specifier) are
+          # baked into project.pbxproj by the withManualCodeSigning Expo
+          # plugin; only the provisioning profile UUID is supplied at build
+          # time as a user-defined setting that the plugin's
+          # PROVISIONING_PROFILE_SPECIFIER references. No code-sign settings
+          # are passed globally, so Pod targets are not affected by
+          # manual-signing overrides.
+          xcodebuild archive \
+            -workspace ChessPrime.xcworkspace \
+            -scheme ChessPrime \
+            -destination 'generic/platform=iOS' \
+            -configuration Release \
+            -archivePath build/ChessPrime.xcarchive \
+            PROVISIONING_PROFILE_UUID="${PROVISIONING_PROFILE_UUID}"
+
+          # Export IPA (manual signing, no account needed)
+          xcodebuild -exportArchive \
+            -archivePath build/ChessPrime.xcarchive \
+            -exportPath build/output \
+            -exportOptionsPlist ExportOptions.plist
+
+          # Calculate build time
+          BUILD_END_TIME=$(date +%s)
+          BUILD_DURATION=$((BUILD_END_TIME - BUILD_START_TIME))
+          BUILD_MINUTES=$((BUILD_DURATION / 60))
+          BUILD_SECONDS=$((BUILD_DURATION % 60))
+          echo "iOS build completed in ${BUILD_MINUTES}m ${BUILD_SECONDS}s"
+
+          # Find the IPA file
+          IPA_FILE=$(find build/output -name "*.ipa" -type f | head -1)
+          echo "IPA_FILE=$IPA_FILE" >> $GITHUB_ENV
+          echo "Built IPA: $IPA_FILE"
+
+      - name: Upload to TestFlight
+        id: testflight-upload
+        continue-on-error: true
+        uses: apple-actions/upload-testflight-build@v1
+        with:
+          app-path: packages/app/ios/build/output/ChessPrime.ipa
+          issuer-id: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          api-key-id: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          api-private-key: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: chess-prime-ipa-${{ env.APP_VERSION }}
+          path: packages/app/ios/build/output/*.ipa
+
+      - name: Prepare Release Summary
+        id: release-summary
+        env:
+          TESTFLIGHT_RESULT: ${{ steps.testflight-upload.outcome }}
+        run: |
+          IPA_FILE=$(find packages/app/ios/build/output -name "*.ipa" -type f | head -1)
+          IPA_FILENAME=$(basename "$IPA_FILE")
+          IPA_SIZE=$(du -h "$IPA_FILE" | cut -f1)
+
+          COMMIT_MSG=$(git log -1 --pretty=format:"%s")
+          COMMIT_AUTHOR=$(git log -1 --pretty=format:"%an")
+          COMMIT_HASH=$(git log -1 --pretty=format:"%h")
+
+          if [ "$TESTFLIGHT_RESULT" = "success" ]; then
+            TESTFLIGHT_STATUS="✅ Uploaded to TestFlight"
+          else
+            TESTFLIGHT_STATUS="⚠️ Skipped (version already exists or upload failed)"
+          fi
+
+          cat > release-summary.txt << EOF
+          ♟️ *Chess Prime iOS Build Complete*
+
+          *Version:* ${{ env.APP_VERSION }}
+          *Build:* #${{ github.run_number }}
+          *Environment:* Production
+
+          📦 *IPA Details:*
+          • File: \`$IPA_FILENAME\`
+          • Size: $IPA_SIZE
+
+          🔨 *Build Info:*
+          • Commit: \`$COMMIT_HASH\` - $COMMIT_MSG
+          • Author: $COMMIT_AUTHOR
+          • Branch: ${{ github.ref_name }}
+
+          ✅ *Status:*
+          • IPA: Generated & Signed
+          • TestFlight: $TESTFLIGHT_STATUS
+
+          🔗 *Links:*
+          • Workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          • Commit: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+          EOF
+
+          echo "IPA_FILE=$IPA_FILE" >> $GITHUB_OUTPUT
+          echo "IPA_FILENAME=$IPA_FILENAME" >> $GITHUB_OUTPUT
+
+      - name: Post Release to Slack
+        id: slack-upload
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+        run: |
+          IPA_FILE="${{ steps.release-summary.outputs.IPA_FILE }}"
+          IPA_FILENAME="${{ steps.release-summary.outputs.IPA_FILENAME }}"
+          IPA_SIZE=$(stat -f%z "$IPA_FILE" 2>/dev/null || stat -c%s "$IPA_FILE")
+          IPA_SIZE_MB=$(($IPA_SIZE / 1024 / 1024))
+
+          echo "📤 Posting release to Slack..."
+          echo "File: $IPA_FILENAME"
+          echo "Size: ${IPA_SIZE_MB} MB"
+
+          echo "Step 1: Posting announcement message..."
+
+          INITIAL_MESSAGE="♟️ *Chess Prime iOS v$APP_VERSION* - Build #${{ github.run_number }}
+
+          Uploading IPA (${IPA_SIZE_MB} MB)..."
+
+          MSG_RESPONSE=$(curl -s -X POST https://slack.com/api/chat.postMessage \
+            -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            --data-urlencode "channel=$SLACK_CHANNEL_ID" \
+            --data-urlencode "text=$INITIAL_MESSAGE")
+
+          if ! echo "$MSG_RESPONSE" | jq -e '.ok == true' > /dev/null 2>&1; then
+            echo "❌ Failed to post announcement message"
+            echo "$MSG_RESPONSE"
+            exit 1
+          fi
+
+          MESSAGE_TS=$(echo "$MSG_RESPONSE" | jq -r '.ts')
+          echo "✅ Posted announcement, timestamp: $MESSAGE_TS"
+          echo "MESSAGE_TS=$MESSAGE_TS" >> $GITHUB_OUTPUT
+
+          echo "Step 2: Getting upload URL..."
+
+          UPLOAD_URL_RESPONSE=$(curl -s -X POST https://slack.com/api/files.getUploadURLExternal \
+            -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "filename=$IPA_FILENAME&length=$IPA_SIZE")
+
+          if ! echo "$UPLOAD_URL_RESPONSE" | jq -e '.ok == true' > /dev/null 2>&1; then
+            echo "❌ Failed to get upload URL"
+            echo "$UPLOAD_URL_RESPONSE"
+            exit 1
+          fi
+
+          UPLOAD_URL=$(echo "$UPLOAD_URL_RESPONSE" | jq -r '.upload_url')
+          FILE_ID=$(echo "$UPLOAD_URL_RESPONSE" | jq -r '.file_id')
+          echo "✅ Got upload URL and file_id: $FILE_ID"
+
+          echo "Step 3: Uploading IPA file..."
+          UPLOAD_HTTP_STATUS=$(curl -s -w "%{http_code}" -o /tmp/upload_response.txt \
+            -X POST "$UPLOAD_URL" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary "@$IPA_FILE")
+
+          if [ "$UPLOAD_HTTP_STATUS" != "200" ]; then
+            echo "❌ Failed to upload file (HTTP $UPLOAD_HTTP_STATUS)"
+            cat /tmp/upload_response.txt
+            exit 1
+          fi
+          echo "✅ File uploaded successfully"
+
+          echo "Step 4: Completing upload and sharing to channel..."
+
+          FILES_JSON="[{\"id\":\"$FILE_ID\",\"title\":\"Chess Prime v$APP_VERSION - iOS IPA\"}]"
+
+          COMPLETE_RESPONSE=$(curl -s -X POST https://slack.com/api/files.completeUploadExternal \
+            -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            --data-urlencode "files=$FILES_JSON" \
+            --data-urlencode "channel_id=$SLACK_CHANNEL_ID" \
+            --data-urlencode "thread_ts=$MESSAGE_TS")
+
+          echo "Complete response: $COMPLETE_RESPONSE"
+
+          if echo "$COMPLETE_RESPONSE" | jq -e '.ok == true' > /dev/null 2>&1; then
+            echo "✅ IPA shared to Slack thread!"
+          else
+            echo "⚠️ File upload completed but sharing may have failed"
+            echo "$COMPLETE_RESPONSE"
+          fi
+
+          echo "Step 5: Updating announcement with file link..."
+
+          FILE_PERMALINK=$(echo "$COMPLETE_RESPONSE" | jq -r '.files[0].permalink // empty')
+          if [ -n "$FILE_PERMALINK" ]; then
+            UPDATED_MESSAGE="♟️ *Chess Prime iOS v$APP_VERSION* - Build #${{ github.run_number }}
+
+          📦 <$FILE_PERMALINK|Download IPA> (${IPA_SIZE_MB} MB)"
+
+            curl -s -X POST https://slack.com/api/chat.update \
+              -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              --data-urlencode "channel=$SLACK_CHANNEL_ID" \
+              --data-urlencode "ts=$MESSAGE_TS" \
+              --data-urlencode "text=$UPDATED_MESSAGE" > /dev/null
+
+            echo "✅ Updated announcement with download link"
+          fi
+
+      - name: Post Release Summary to Thread
+        if: always() && steps.slack-upload.outputs.MESSAGE_TS
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          MESSAGE_TS: ${{ steps.slack-upload.outputs.MESSAGE_TS }}
+        run: |
+          RELEASE_SUMMARY=$(cat release-summary.txt)
+
+          echo "Posting release summary to thread..."
+
+          RESPONSE=$(curl -s -X POST https://slack.com/api/chat.postMessage \
+            -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            --data-urlencode "channel=$SLACK_CHANNEL_ID" \
+            --data-urlencode "thread_ts=$MESSAGE_TS" \
+            --data-urlencode "text=$RELEASE_SUMMARY")
+
+          if echo "$RESPONSE" | jq -e '.ok == true' > /dev/null 2>&1; then
+            echo "✅ Release summary posted to thread!"
+          else
+            echo "⚠️ Failed to post release summary to thread"
+            echo "$RESPONSE"
+          fi
