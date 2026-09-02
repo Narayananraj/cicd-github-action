@@ -1,67 +1,57 @@
-# CI/CD Learning Repo
+# CI/CD Pipelines — Chess Prime
 
-A hands-on collection of production-style GitHub Actions CI/CD pipelines, built while learning DevOps, MLOps, and Cloud practices — covering an EKS-deployed backend service and a full multi-platform app release pipeline (Android, Android TV, iOS — two variants — and Desktop for macOS/Windows). Each workflow is a real, runnable example, not a toy — the goal is practical, real-world capability for mid-to-senior DevOps/Cloud roles.
+Production-grade GitHub Actions workflows covering backend deployment to AWS EKS and multi-platform application delivery for Android, Android TV, iOS, and Desktop (macOS/Windows).
 
-## Why this repo exists
+## Overview
 
-Most CI/CD tutorials stop at "build and push." These examples go further:
-- Secret validation before the expensive steps run
-- Retry logic for known-flaky third-party downloads
-- Slack success/failure notifications on every pipeline (webhook and Bot API variants)
-- Checksums, artifact retention, and cleanup of sensitive files (e.g. decoded keystores)
-- Cost-consciousness baked into every design choice, not bolted on after
+This repository contains the CI/CD pipeline definitions used to build, sign, and release the Chess Prime platform across every supported surface. Each workflow is designed for real operational use: secrets are validated before expensive steps run, signing artifacts are handled and cleaned up securely, failures are surfaced through Slack, and every design decision accounts for build cost and runner efficiency.
 
-## Workflow examples in this repo
+The pipelines are organized by deployment target rather than by platform convention, so each file can be read end-to-end as a complete release process — from source checkout to store submission or production rollout.
 
-| File | What it teaches | Deploy target |
+## Repository Structure
+
+| File | Deployment Target | Description |
 |---|---|---|
-| `web-service-deployment.yml` | Docker build → ECR push (OIDC, no static keys) → `kubectl set image` → rollout verification → Slack notify | AWS EKS (`ap-south-1`) |
-| `android-deployment.yml` | Gradle signed AAB/APK build on a Depot runner → Google Play internal track | Google Play |
-| `androidtv-deployment.yml` | Gradle wrapper generation + dependency caching → signed AAB/APK → checksums → Google Play internal track → Slack notify | Google Play |
-| `ios-deployment.yml` | Xcode archive/export with manual signing on a self-hosted macOS runner → TestFlight | TestFlight |
-| `ios-depoloyment-depot.yml` | Expo/React Native prebuild → CocoaPods install with retry → Xcode archive on a Depot macOS runner → TestFlight → Slack Bot file upload with threaded release summary | TestFlight |
-| `desktop-windows-mac-deployment.yml` | Multi-job pipeline: release metadata from git tag → secret/certificate preflight → macOS universal Rust build (sign + notarize + DMG) → Windows build (Inno Setup installer) → checksums → Ed25519-signed `latest.json` update manifest → publish | S3 / DigitalOcean Spaces + GitHub Releases |
+| `web-service-deployment.yml` | AWS EKS (`ap-south-1`) | Builds and pushes a Docker image to ECR using OIDC role assumption, deploys via `kubectl set image`, verifies rollout status, and reports build status to Slack. |
+| `android-deployment.yml` | Google Play | Builds a signed Android App Bundle and APK using Gradle on a Depot-hosted runner, then publishes to the Google Play internal testing track. |
+| `androidtv-deployment.yml` | Google Play | Generates the Gradle wrapper, applies dependency caching, builds and signs the Android TV release, generates build checksums, publishes to Google Play, and reports status to Slack. |
+| `ios-deployment.yml` | TestFlight | Archives and exports the native iOS application using manual code signing on a self-hosted macOS runner, then uploads the build to TestFlight. |
+| `ios-depoloyment-depot.yml` | TestFlight | Builds the Expo/React Native iOS application on a Depot-hosted macOS runner, including CocoaPods installation with retry handling, and uploads the release artifact to Slack with a threaded build summary. |
+| `desktop-windows-mac-deployment.yml` | S3 / DigitalOcean Spaces + GitHub Releases | Multi-job pipeline that derives release metadata from the git tag, validates Apple signing credentials, builds and notarizes a universal macOS binary, builds a signed Windows installer, generates checksums, produces an Ed25519-signed update manifest, and publishes all release artifacts. |
 
-Each workflow file has inline comments explaining *why* a step exists, not just *what* it does — especially around retry logic, secret handling, and signing.
+## Engineering Practices
 
-## Core concepts covered so far
+- **Secret validation before execution** — required secrets and variables are checked at the start of each workflow so failures surface immediately rather than after minutes of build time.
+- **Secure signing material handling** — decoded keystores, certificates, and provisioning profiles are removed from the runner filesystem with `if: always()` cleanup steps.
+- **OIDC over long-lived credentials** — AWS authentication uses short-lived, role-based OIDC tokens instead of static access keys.
+- **Dependency caching** — Gradle and Cargo caches are keyed on lockfile and wrapper hashes to reduce redundant downloads across runs.
+- **Retry handling for known network flakiness** — CocoaPods installs and WebRTC prebuilt binary downloads include bounded retry logic to prevent transient failures from breaking a release.
+- **Runner selection by workload** — GitHub-hosted, Depot-hosted, and self-hosted macOS runners are each used where they are the most cost-appropriate choice for the job.
+- **Release traceability** — checksums, versioned artifacts, and signed update manifests accompany every desktop release.
+- **Build status visibility** — Slack notifications (webhook and Bot API) report success or failure with direct links to the workflow run.
 
-- **Secrets & signing**: Android keystores, Apple certificates/provisioning profiles (including broadcast/share extension profiles), App Store Connect API keys, Ed25519 manifest signing, OIDC vs static AWS keys
-- **Kubernetes deploys**: `kubectl set image`, rollout status checks, namespace-scoped deploys, ECR image tagging (SHA + `latest`)
-- **Multi-platform mobile builds**: native Gradle (Android/Android TV) vs Expo/React Native prebuild (iOS via Depot), same target platform built two different ways
-- **Build reliability**: retry wrappers for flaky network downloads (CocoaPods, WebRTC prebuilt binaries), Sentry source-map upload with graceful fallback when a secret is missing
-- **Runner strategy**: GitHub-hosted vs Depot-hosted (Ubuntu + macOS) vs self-hosted in-house macOS runners, and when each makes sense
-- **Notifications**: Slack webhook (simple pass/fail attachment) vs Slack Bot API (file upload + threaded release notes)
-- **Caching**: Gradle (`~/.gradle`) and Cargo (`~/.cargo`, sccache) dependency caching keyed on lockfile/wrapper hashes
-- **Release management**: version/channel inference from git tags (release vs beta/rc/alpha), signed update manifests, draft GitHub Releases with auto-generated notes
+## Cost Optimization Practices
 
-## Cost optimization checklist
+- OIDC role assumption removes the operational cost of rotating and securing long-lived AWS credentials.
+- Dependency and toolchain caching (Gradle, Cargo/sccache) reduces repeated download and compile time across runs.
+- Release-triggered builds (git tags) keep expensive mobile and desktop jobs from running on every push.
+- Runner tiers are matched to workload size rather than defaulting to the largest available tier.
+- `continue-on-error` is scoped only to genuinely non-fatal steps, such as re-uploading an existing store version, and is never applied to security or validation steps.
+- ECR image lifecycle policies and tagging strategy prevent unbounded storage growth.
 
-Applied across these pipelines — use this as a reference when adding a new workflow:
+## Roadmap
 
-- [ ] Use OIDC role assumption instead of long-lived cloud provider keys (`web-service-deployment.yml`)
-- [ ] Cache dependencies (Gradle `~/.gradle`, Cargo `~/.cargo`, npm/pnpm store) keyed on lockfile/wrapper hash
-- [ ] Right-size runners — Depot Ubuntu/macOS tiers per job instead of defaulting to the largest tier; self-hosted only where Apple's macOS licensing/hardware needs make it worth it
-- [ ] Use `continue-on-error: true` only where a failure is genuinely non-fatal (e.g., re-upload of an existing Play/TestFlight version), never on a security scan
-- [ ] Set an ECR/registry lifecycle policy to expire untagged images
-- [ ] Trigger builds on git tags, not every push, for expensive mobile/desktop release jobs
-- [ ] Clean up decoded secrets (keystores, `.p12`, provisioning profiles) from runner disk with `if: always()` so nothing lingers even on failure
-- [ ] Prefer GitHub-hosted runners over paid runner services (Depot/self-hosted) unless build time or platform requirement (macOS) is an actual bottleneck
+- Migrate the EKS deployment from `kubectl set image` to Helm-based releases.
+- Introduce ArgoCD for GitOps-based cluster synchronization, including ApplicationSets and automated image updates.
+- Add a Terraform-driven infrastructure pipeline with plan-on-PR and apply-on-merge stages.
+- Introduce policy-as-code enforcement (OPA Gatekeeper / Kyverno) with admission-level verification of signed container images.
+- Add cost visibility tooling (Kubecost/OpenCost) for the EKS environment.
+- Consolidate the two iOS release workflows into a single Fastlane-driven pipeline shared across platforms.
+- Add a Prometheus and Grafana observability stack for the EKS cluster.
+- Introduce Vault on EKS for centralized secrets management.
 
-## Roadmap — topics to add next
+## Usage
 
-- [ ] Helm-based EKS deploy (replace raw `kubectl set image` with `helm upgrade --install`)
-- [ ] ArgoCD GitOps example — CI only builds/pushes; ArgoCD syncs the cluster (ApplicationSets with Git generator + Image Updater for automated ECR sync)
-- [ ] Terraform-triggered infra pipeline (plan on PR, apply on merge, remote state via S3 + DynamoDB)
-- [ ] OPA Gatekeeper / Kyverno policy-as-code checks in CI, including admission-level enforcement of Cosign-signed images
-- [ ] Kubecost/OpenCost integration for cost visibility dashboards
-- [ ] Canary/blue-green deploy pattern with Argo Rollouts
-- [ ] Consolidate the two iOS workflows (native Xcode vs Expo/Depot) into a single Fastlane-driven pipeline shared across iOS/Android/Desktop signing logic
-- [ ] Prometheus + Grafana observability stack on EKS
-- [ ] Vault on EKS via Helm for secrets management (replacing base64-only Kubernetes Secrets)
-
-## How to use this repo
-
-1. Each workflow file is standalone — copy the one you need into `.github/workflows/` in your own project.
-2. Replace placeholder secret names, package/bundle identifiers, and cluster/region values with your own.
-3. Read the inline comments before removing anything that looks like "unnecessary" retry logic or validation — most of it exists because of a real failure encountered while building these.
+1. Copy the required workflow file into `.github/workflows/` in the target repository.
+2. Replace placeholder secrets, variables, package identifiers, and cluster or region values with environment-specific configuration.
+3. Review the inline comments before modifying retry logic, validation steps, or cleanup steps — each exists to address a specific failure mode encountered in production use.
