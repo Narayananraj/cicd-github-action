@@ -1,4 +1,4 @@
-# CI/CD Pipelines — Chess Prime
+# CI/CD Pipelines — Chess Prime (Personal Project)
 
 Production-grade GitHub Actions workflows covering backend deployment to AWS EKS and multi-platform application delivery for Android, Android TV, iOS, and Desktop (macOS/Windows).
 
